@@ -4,13 +4,13 @@ WORKDIR /app
 COPY build.gradle settings.gradle /app/
 COPY gradlew /app/
 COPY gradle /app/gradle
-COPY .gradle /app/.gradle 
+COPY .gradle /app/.gradle
 
 COPY src /app/src
 
 RUN chmod +x ./gradlew
 
-RUN ./gradlew bootJar -x test --build-cache
+RUN ./gradlew bootJar -x test --build-cache --no-daemon --refresh-dependencies
 
 FROM openjdk:17-jdk-slim-buster
 WORKDIR /app
