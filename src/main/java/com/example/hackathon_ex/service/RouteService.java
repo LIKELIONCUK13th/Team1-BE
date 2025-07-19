@@ -65,4 +65,42 @@ public class RouteService {
         }
         return new RouteResult(endX, endY, duration, distance,path);
     }
+    public OptimalRouteResponse calculateOptimalRoute(OptimalRoute request) {
+        List<LocationRequest> waypoints = request.getWaypoints();
+        if (waypoints == null || waypoints.size() < 2) {
+            throw new IllegalArgumentException("Waypoints must contain at least two points");
+        }
+        int totalDistance = 0;
+        int totalDuration = 0;
+        List<Point> fullPath = new ArrayList<>();
+        for (int i = 0; i < waypoints.size() - 1; i++) {
+            LocationRequest origin = waypoints.get(i);
+            LocationRequest destination = waypoints.get(i + 1);
+            KakaoRouteResponse response = getWebClient().get()
+                    .uri(uriBuilder -> uriBuilder
+                            .path("/v1/directions")
+                            .queryParam("origin", origin.getX() + "," + origin.getY())
+                            .queryParam("destination", destination.getX() + "," + destination.getY())
+                            .queryParam("priority", "DISTANCE")
+                            .build())
+                    .retrieve()
+                    .bodyToMono(KakaoRouteResponse.class)
+                    .block();
+            if (response != null) {
+                int duration = response.getRoutes().get(0).getSummary().getDuration();
+                int distance = response.getRoutes().get(0).getSummary().getDistance();
+                totalDistance += distance;
+                totalDuration += duration;
+                List<Double> vertexes = response.getRoutes().get(0).getSections().get(0).getRoads()
+                        .stream().flatMap(road -> road.getVertexes().stream())
+                        .toList();
+                for (int j = 0; j < vertexes.size(); j += 2) {
+                    double x = vertexes.get(j);
+                    double y = vertexes.get(j + 1);
+                    fullPath.add(new Point(x, y));
+                }
+            }
+        }
+        return new OptimalRouteResponse(totalDuration, totalDistance, fullPath);
+    }
 }

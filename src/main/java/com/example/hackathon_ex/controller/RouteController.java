@@ -1,8 +1,6 @@
 package com.example.hackathon_ex.controller;
 
-import com.example.hackathon_ex.dto.LocationRequest;
-import com.example.hackathon_ex.dto.RouteRequest;
-import com.example.hackathon_ex.dto.RouteResult;
+import com.example.hackathon_ex.dto.*;
 import com.example.hackathon_ex.service.RouteService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -26,4 +24,10 @@ public class RouteController {
         List<RouteResult> results = routeService.calculateRouteToMiddle(origins);
         return ResponseEntity.ok(results);
     }
+
+    @PostMapping("/optimal")
+    public ResponseEntity<OptimalRouteResponse> getOptimalRoute(@RequestBody OptimalRoute request){
+        return ResponseEntity.ok(routeService.calculateOptimalRoute(request));
+    }
+
 }
