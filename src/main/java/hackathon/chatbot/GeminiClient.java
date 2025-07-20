@@ -13,42 +13,45 @@ import com.google.cloud.vertexai.generativeai.GenerativeModel;
 import com.google.cloud.vertexai.generativeai.ResponseHandler;
 import org.springframework.stereotype.Component;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.beans.factory.annotation.Value;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
 
 import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
 import com.google.protobuf.ListValue;
+
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 @Component
 public class GeminiClient {
 
-    @Value("${gemini.api-key}")
+    @org.springframework.beans.factory.annotation.Value("${gemini.api-key}")
     private final String geminiApiKey;
 
-    @Value("${gemini.model-name}")
+    @org.springframework.beans.factory.annotation.Value("${gemini.model-name}")
     private final String geminiModelName;
 
-    @Value("${GOOGLE_CLOUD_PROJECT_ID}")
+    @org.springframework.beans.factory.annotation.Value("${GOOGLE_CLOUD_PROJECT_ID}")
     private final String projectId;
 
     private VertexAI vertexAI;
     private GenerativeModel model;
-
-    private final List<Content> history = new ArrayList<>();
+    private final ObjectMapper objectMapper;
 
     public GeminiClient(
             ObjectMapper objectMapper,
-            @Value("${gemini.api-key}") String geminiApiKey,
-            @Value("${gemini.model-name}") String geminiModelName,
-            @Value("${GOOGLE_CLOUD_PROJECT_ID}") String projectId
+            @org.springframework.beans.factory.annotation.Value("${gemini.api-key}") String geminiApiKey,
+            @org.springframework.beans.factory.annotation.Value("${gemini.model-name}") String geminiModelName,
+            @org.springframework.beans.factory.annotation.Value("${GOOGLE_CLOUD_PROJECT_ID}") String projectId
     ) {
+        this.objectMapper = objectMapper;
         this.geminiApiKey = geminiApiKey;
         this.geminiModelName = geminiModelName;
         this.projectId = projectId;
@@ -83,111 +86,118 @@ public class GeminiClient {
         }
     }
 
-    public String getGeminiResponse(String placeName, String userQuestion, KakaoMapClient kakaoMapClient) {
-        try {
-            String promptContext;
-            if (history.isEmpty()) {
-                promptContext = String.format("지금부터 '%s' 주변 장소에 대해 이야기할 것입니다. 다음 질문에 답해주세요: '%s'\n\n", placeName, userQuestion);
-            } else {
-               promptContext = String.format("사용자의 질문은 '%s'입니다. 이 질문에 답하기 위해, 필요하다면 '%s' 주변에서 새로운 장소를 검색하거나 이전에 언급된 장소와 다른 장소를 찾아주세요.\n\n", userQuestion, placeName);
-            }
+    public Mono<String> getGeminiResponse(String userPrompt, KakaoMapClient kakaoMapClient, List<Content> currentHistory) {
+        Content userContent = Content.newBuilder()
+                .addParts(Part.newBuilder().setText(userPrompt).build())
+                .setRole("user")
+                .build();
+        currentHistory.add(userContent); // 사용자 질문을 기록에 추가
 
-            String fullUserPrompt = promptContext +
-                    "장소 검색 결과가 있다면, 다음 양식에 맞춰 장소를 추천해주세요:" +
-                    "\n\n[번호]. [장소 이름] ([장소 카테고리])" +
-                    "\n[장소 주소]" +
-                    "\n[장소 전화번호]" +
-                    "\n[장소에 대한 모델의 간략한 설명 (특징, 분위기, 추천 대상 등)]" +
-                    "\n\n각 추천 장소는 서로 다른 줄로 구분해주세요." +
-                    "\n만약 검색 결과가 없다면, '죄송합니다. 요청하신 조건에 맞는 장소를 찾을 수 없습니다. 다른 검색 조건을 알려주시겠어요?'와 같이 응답해주세요.";
+        // Mono를 반환하여 비동기 처리
+        // Gemini API 호출은 네트워크 IO이므로, blocking 호출이 허용되는 스레드에서 실행되도록 fromCallable + publishOn을 사용합니다.
+        return Mono.fromCallable(() -> model.generateContent(new ArrayList<>(currentHistory))) // history 복사본 전달
+                .publishOn(Schedulers.boundedElastic()) // Gemini API 호출을 blocking 가능한 스레드로 전환
+                .flatMap(response -> {
+                    Content modelContent = response.getCandidates(0).getContent();
+                    String modelResponseText = ResponseHandler.getText(response); // 기본 응답 텍스트
 
+                    // 모델 응답을 history에 추가 (Function Call이 있는 경우와 없는 경우 모두)
+                    currentHistory.add(modelContent); // 모델 응답 (함수 호출 포함 가능)을 기록에 추가
 
-            history.add(Content.newBuilder()
-                    .setRole("user")
-                    .addParts(Part.newBuilder().setText(fullUserPrompt).build())
-                    .build());
+                    if (modelContent.getPartsCount() > 0 && modelContent.getParts(0).hasFunctionCall()) {
+                        String functionName = modelContent.getParts(0).getFunctionCall().getName();
 
-            GenerateContentResponse response = model.generateContent(history);
-            Content modelContent = response.getCandidates(0).getContent();
+                        if ("search_places".equals(functionName)) {
+                            Struct functionArgs = modelContent.getParts(0).getFunctionCall().getArgs();
 
-            if (modelContent.getPartsCount() > 0 && modelContent.getParts(0).hasFunctionCall()) {
-                history.add(modelContent);
-            } else {
-                history.add(modelContent);
-            }
+                            final String extractedQuery;
+                            if (functionArgs.getFieldsMap().containsKey("query")) {
+                                Value queryValue = functionArgs.getFieldsMap().get("query");
+                                if (queryValue.hasStringValue()) {
+                                    extractedQuery = queryValue.getStringValue();
+                                } else {
+                                    extractedQuery = null;
+                                }
+                            } else {
+                                extractedQuery = null;
+                            }
 
-            if (modelContent.getPartsCount() > 0 && modelContent.getParts(0).hasFunctionCall()) {
-                String functionName = modelContent.getParts(0).getFunctionCall().getName();
+                            if (extractedQuery == null || extractedQuery.isEmpty()) {
+                                // Gemini가 검색 쿼리를 제대로 생성하지 못하면, 해당 오류 메시지를 history에 추가하고 반환
+                                // 이 경우는 모델이 오류를 이해하고 답변하도록 하지 않고, 직접 오류 반환
+                                // currentHistory.remove(currentHistory.size() - 1); // 잘못된 modelContent 제거
+                                return Mono.just("Gemini가 검색 쿼리를 제대로 생성하지 못했습니다. 질문을 명확히 해주세요.");
+                            }
 
-                if ("search_places".equals(functionName)) {
-                    Struct functionArgs = modelContent.getParts(0).getFunctionCall().getArgs();
-                    String query = null;
-                    if (functionArgs.getFieldsMap().containsKey("query")) {
-                        com.google.protobuf.Value queryValue = functionArgs.getFieldsMap().get("query");
-                        if (queryValue.hasStringValue()) {
-                            query = queryValue.getStringValue();
+                            System.out.println("Gemini가 카카오맵 검색을 제안했습니다. 검색 쿼리: " + extractedQuery);
+
+                            return kakaoMapClient.searchPlace(extractedQuery) // extractedQuery 사용
+                                    .flatMap(places -> {
+                                        Struct.Builder responseStructBuilder = Struct.newBuilder();
+
+                                        if (places == null || places.isEmpty()) {
+                                            responseStructBuilder.putFields("status", Value.newBuilder().setStringValue("No results").build());
+                                            responseStructBuilder.putFields("message", Value.newBuilder().setStringValue("No places found for query: " + extractedQuery).build());
+                                        } else {
+                                            List<Value> placeValueList = new java.util.ArrayList<>();
+                                            for (Map<String, String> place : places) {
+                                                Struct.Builder placeStructBuilder = Struct.newBuilder();
+                                                place.forEach((key, val) -> placeStructBuilder.putFields(key, Value.newBuilder().setStringValue(val).build()));
+                                                placeValueList.add(Value.newBuilder().setStructValue(placeStructBuilder.build()).build());
+                                            }
+                                            responseStructBuilder.putFields("places", Value.newBuilder().setListValue(ListValue.newBuilder().addAllValues(placeValueList).build()).build());
+                                            responseStructBuilder.putFields("status", Value.newBuilder().setStringValue("success").build());
+                                        }
+                                        Struct toolOutputStruct = responseStructBuilder.build();
+
+                                        // FunctionResponse Content를 생성하고 history에 추가
+                                        // FunctionResponse를 담는 Content의 role은 'user'여야 합니다.
+                                        Content toolResponseContent = Content.newBuilder()
+                                                .addParts(Part.newBuilder()
+                                                        .setFunctionResponse(
+                                                                FunctionResponse.newBuilder()
+                                                                        .setName(functionName)
+                                                                        .setResponse(toolOutputStruct)
+                                                                        .build())
+                                                        .build())
+                                                .setRole("user") // <<-- 이 부분이 중요합니다: 'user' 역할
+                                                .build();
+                                        currentHistory.add(toolResponseContent);
+
+                                        // 도구 결과와 함께 대화 기록을 다시 모델에 전달하여 최종 응답 생성
+                                        return Mono.fromCallable(() -> model.generateContent(new ArrayList<>(currentHistory)))
+                                                .publishOn(Schedulers.boundedElastic())
+                                                .map(finalModelResponse -> {
+                                                    String finalModelResponseText = ResponseHandler.getText(finalModelResponse);
+                                                    Content finalModelContent = Content.newBuilder()
+                                                            .addParts(Part.newBuilder().setText(finalModelResponseText).build())
+                                                            .setRole("model")
+                                                            .build();
+                                                    currentHistory.add(finalModelContent);
+                                                    return finalModelResponseText;
+                                                })
+                                                .onErrorResume(e -> {
+                                                    System.err.println("Error generating final content after tool call: " + e.getMessage());
+                                                    return Mono.just("Gemini API 최종 응답 생성 중 오류가 발생했습니다: " + e.getMessage());
+                                                });
+                                    })
+                                    .onErrorResume(e -> {
+                                        System.err.println("Error calling KakaoMapClient: " + e.getMessage());
+                                        return Mono.just("카카오맵 검색 중 오류가 발생했습니다: " + e.getMessage());
+                                    });
+
+                        } else {
+                            return Mono.just("Gemini가 알 수 없는 함수를 호출하려 했습니다: " + functionName);
                         }
-                    }
-
-                    if (query == null || query.isEmpty()) {
-                        return "Gemini가 검색 쿼리를 제대로 생성하지 못했습니다. 질문을 명확히 해주세요.";
-                    }
-
-                    System.out.println("Gemini가 카카오맵 검색을 제안했습니다. 검색 쿼리: " + query);
-
-                    List<Map<String, String>> places = kakaoMapClient.searchPlace(query);
-
-                    Struct.Builder responseStructBuilder = Struct.newBuilder();
-
-                    if (places.isEmpty()) {
-                        responseStructBuilder.putFields("status", com.google.protobuf.Value.newBuilder().setStringValue("No results").build());
-                        responseStructBuilder.putFields("message", com.google.protobuf.Value.newBuilder().setStringValue("No places found for query: " + query).build());
                     } else {
-                        List<com.google.protobuf.Value> placeValueList = new java.util.ArrayList<>();
-                        for (Map<String, String> place : places) {
-                            Struct.Builder placeStructBuilder = Struct.newBuilder();
-                            place.forEach((key, val) -> placeStructBuilder.putFields(key, com.google.protobuf.Value.newBuilder().setStringValue(val).build()));
-                            placeValueList.add(com.google.protobuf.Value.newBuilder().setStructValue(placeStructBuilder.build()).build());
-                        }
-                        responseStructBuilder.putFields("places", com.google.protobuf.Value.newBuilder().setListValue(ListValue.newBuilder().addAllValues(placeValueList).build()).build());
-                        responseStructBuilder.putFields("status", com.google.protobuf.Value.newBuilder().setStringValue("success").build());
+                        // Function Call이 없는 경우, 이미 modelContent가 history에 추가되었으므로 여기서 추가 작업 없음
+                        return Mono.just(modelResponseText);
                     }
-                    Struct toolOutputStruct = responseStructBuilder.build();
-
-                    Content functionResponseContent = Content.newBuilder()
-                            .addParts(Part.newBuilder()
-                                    .setFunctionResponse(
-                                            FunctionResponse.newBuilder()
-                                                    .setName(functionName)
-                                                    .setResponse(toolOutputStruct)
-                                                    .build())
-                                    .build())
-                            .build();
-                    history.add(functionResponseContent);
-
-                    GenerateContentResponse finalResponse = model.generateContent(history);
-                    String finalAnswer = ResponseHandler.getText(finalResponse);
-                    history.add(Content.newBuilder()
-                            .setRole("model")
-                            .addParts(Part.newBuilder().setText(finalAnswer).build())
-                            .build());
-                    return finalAnswer;
-
-                } else {
-                    return "Gemini가 알 수 없는 함수를 호출하려 했습니다: " + functionName;
-                }
-            } else {
-                String answer = ResponseHandler.getText(response);
-                history.add(Content.newBuilder()
-                        .setRole("model")
-                        .addParts(Part.newBuilder().setText(answer).build())
-                        .build());
-                return answer;
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-            return "Gemini API 호출 중 오류가 발생했습니다: " + e.getMessage();
-        }
+                })
+                .onErrorResume(e -> {
+                    System.err.println("Error in initial Gemini API call: " + e.getMessage());
+                    return Mono.just("Gemini API 초기 호출 중 오류가 발생했습니다: " + e.getMessage());
+                });
     }
 
     @PreDestroy
